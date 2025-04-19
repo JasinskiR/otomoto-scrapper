@@ -213,43 +213,40 @@ class AsyncOtomotoScraper:
             # Extract VIN - special case for hidden VIN
             vin = await self.extract_vin_with_playwright(url)
             
-            # Extract price indicator and price range directly from the HTML
-            # This is more reliable than using Playwright for this information
-            price_indicator = None
-            price_range = None
-            
-            # Find the price indicator element
-            price_indicator_tag = soup.find("p", {"data-testid": re.compile("price-indicator-label-.*")})
-            if price_indicator_tag:
-                # Get the actual indicator text
-                price_indicator = price_indicator_tag.text.strip()
-                
-                # Extract the indicator type from the data-testid attribute
-                data_testid = price_indicator_tag.get("data-testid", "")
-                indicator_match = re.search(r'price-indicator-label-(\w+)', data_testid)
-                
-                # Get the current car price
-                price_tag = soup.select_one("span.offer-price__number") or soup.select_one(".offer-price")
-                
-                # Only estimate price range if we have both indicator type and price
-                if indicator_match and price_tag:
-                    try:
-                        indicator_type = indicator_match.group(1)
-                        price = int(re.sub(r'\D', '', price_tag.text))
-                        
-                        # Create estimated price ranges based on indicator type
-                        if indicator_type == "ABOVE":
-                            lower_bound = int(price * 0.85)
-                            price_range = f"{lower_bound}-{price} PLN"
-                        elif indicator_type == "BELOW":
-                            upper_bound = int(price * 1.15)
-                            price_range = f"{price}-{upper_bound} PLN"
-                        elif indicator_type == "IN":
-                            lower_bound = int(price * 0.9)
-                            upper_bound = int(price * 1.1)
-                            price_range = f"{lower_bound}-{upper_bound} PLN"
-                    except (ValueError, AttributeError) as e:
-                        print(f"Error estimating price range: {e}")
+            # Extract price indicator and price range using Playwright
+            price_indicator, price_range = await self.extract_price_range_with_playwright(url)
+
+            # If Playwright method failed or didn't find price range, fall back to estimation
+            if price_indicator and not price_range:
+                # Find the price indicator element in static HTML
+                price_indicator_tag = soup.find("p", {"data-testid": re.compile("price-indicator-label-.*")})
+                if price_indicator_tag:
+                    # Extract the indicator type from the data-testid attribute
+                    data_testid = price_indicator_tag.get("data-testid", "")
+                    indicator_match = re.search(r'price-indicator-label-(\w+)', data_testid)
+                    
+                    # Get the current car price
+                    price_tag = soup.select_one("span.offer-price__number") or soup.select_one(".offer-price")
+                    
+                    # Only estimate price range if we have both indicator type and price
+                    if indicator_match and price_tag:
+                        try:
+                            indicator_type = indicator_match.group(1)
+                            price = int(re.sub(r'\D', '', price_tag.text))
+                            
+                            # Create estimated price ranges based on indicator type
+                            if indicator_type == "ABOVE":
+                                lower_bound = int(price * 0.85)
+                                price_range = f"{lower_bound}-{price} PLN"
+                            elif indicator_type == "BELOW":
+                                upper_bound = int(price * 1.15)
+                                price_range = f"{price}-{upper_bound} PLN"
+                            elif indicator_type == "IN":
+                                lower_bound = int(price * 0.9)
+                                upper_bound = int(price * 1.1)
+                                price_range = f"{lower_bound}-{upper_bound} PLN"
+                        except (ValueError, AttributeError) as e:
+                            print(f"Error estimating price range: {e}")
             
             # If Playwright failed, fall back to original method
             if not vin:
@@ -360,6 +357,71 @@ class AsyncOtomotoScraper:
                 else:
                     print(f"Error extracting VIN with Playwright: {e}")
                     return None
+    
+    async def extract_price_range_with_playwright(self, url) -> tuple:
+        """Extract actual price range and indicator using Playwright."""
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(headless=True)
+                    context = await browser.new_context(
+                        viewport={"width": 1920, "height": 1080},
+                        user_agent=random.choice(USER_AGENTS)
+                    )
+                    page = await context.new_page()
+                    
+                    # Navigate to the page
+                    await page.goto(url, wait_until="load", timeout=30000)
+                    
+                    # Handle cookie consent if present
+                    try:
+                        consent_button = page.locator('button[id="onetrust-accept-btn-handler"]')
+                        if await consent_button.count() > 0:
+                            await consent_button.click()
+                            await page.wait_for_timeout(1000)
+                    except Exception:
+                        pass
+
+                    # Get the price indicator text first (before clicking)
+                    indicator_element = page.locator("p[data-testid^='price-indicator-label-']")
+                    price_indicator = None
+                    if await indicator_element.count() > 0:
+                        price_indicator = await indicator_element.text_content()
+                        
+                        # Click on the price indicator to open modal
+                        await indicator_element.click()
+                        
+                        # Wait for modal to appear
+                        try:
+                            await page.wait_for_selector("div[data-testid='find-more-about-modal-content']", timeout=5000)
+                            
+                            # Extract the content with the price range
+                            modal_content = page.locator("div.ee3ywn12 p.ee3ywn16")
+                            if await modal_content.count() > 0:
+                                content_text = await modal_content.text_content()
+                                
+                                # Extract price range using regex
+                                price_match = re.search(r'(\d[\d\s]*\d)\s*-\s*(\d[\d\s]*\d)\s*PLN', content_text)
+                                if price_match:
+                                    lower = price_match.group(1).replace(" ", "")
+                                    upper = price_match.group(2).replace(" ", "")
+                                    price_range = f"{lower}-{upper} PLN"
+                                    
+                                    await browser.close()
+                                    return price_indicator, price_range
+                        except Exception as e:
+                            print(f"Error extracting price from modal: {e}")
+
+                    await browser.close()
+                    return price_indicator, None
+            except Exception as e:
+                if attempt < max_retries:
+                    print(f"Retry {attempt+1}/{max_retries} after error extracting price range: {e}")
+                    await asyncio.sleep(5)
+                else:
+                    print(f"Error extracting price range with Playwright: {e}")
+                    return None, None
 
     async def scrape(self) -> List[Car]:
         async with aiohttp.ClientSession() as session:
